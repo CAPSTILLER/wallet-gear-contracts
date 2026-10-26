@@ -142,26 +142,63 @@ contract DeskTest is Test {
         assertEq(gt.balanceOf(TREASURY) - tr0, p2 / 2);
     }
 
-    function test_idleOfferExpiry() public {
+    uint256 constant Y = 365 days;
+
+    function test_offerAbandonedAt365FromCreation() public {
         (uint256 id, uint256[] memory a) = _offer(2, 14);
         uint256 t0 = block.timestamp;
-        vm.warp(t0 + 100 days);
-        (uint256 b1, uint256[] memory g1) = _bid(bob, id, 1, 15); // bid refreshes the clock
-        uint256 t1 = block.timestamp;
-        assertEq(d.offerExpiry(id), t1 + W);
-        vm.warp(t1 + W - 1);
-        assertFalse(d.inBin(a[0]));
-        vm.warp(t1 + W);
-        assertTrue(d.inBin(a[0])); assertTrue(d.inBin(g1[0]));
-        _approveAll(alice);
+        assertEq(d.offerExpiry(id), t0 + Y);
+        vm.warp(t0 + Y - 10);
+        (uint256 b1, uint256[] memory g1) = _bid(bob, id, 1, 15); // late bid does NOT extend
+        assertEq(d.offerExpiry(id), t0 + Y);
+        assertEq(d.bidDeadline(b1), t0 + Y);
+        vm.warp(t0 + Y - 1);
+        assertFalse(d.inBin(a[0])); assertFalse(d.inBin(g1[0]));
+        vm.warp(t0 + Y);
+        assertTrue(d.inBin(a[0])); assertTrue(d.inBin(a[1])); assertTrue(d.inBin(g1[0]));
+        _approveAll(alice); _approveAll(bob);
         vm.prank(alice); vm.expectRevert(GearTradeDesk.WindowClosed.selector); d.cancelOffer(id);
         vm.prank(alice); vm.expectRevert(GearTradeDesk.WindowClosed.selector); d.acceptBid(id, b1);
+        vm.prank(bob); vm.expectRevert(GearTradeDesk.WindowClosed.selector); d.withdrawBid(b1);
         uint256[] memory x = _gears(carol, 1, 16);
         vm.prank(carol); vm.expectRevert(GearTradeDesk.WindowClosed.selector); d.placeBid(id, x);
         (, uint256 n) = d.binTokensFromOffers(0, 10); assertEq(n, 2);
+        (, uint256 nb) = d.binTokens(0, 10); assertEq(nb, 1);
         gt.mint(dave, 1000e6); _approveAll(dave);
-        vm.startPrank(dave); d.buyFromBin(a[0]); d.buyFromBin(g1[0]); vm.stopPrank();
-        assertEq(g.ownerOf(a[0]), dave); assertEq(g.ownerOf(g1[0]), dave);
+        vm.startPrank(dave); d.buyFromBin(a[0]); d.buyFromBin(a[1]); d.buyFromBin(g1[0]); vm.stopPrank();
+        assertEq(g.balanceOf(dave), 3); assertEq(g.balanceOf(address(d)), 0);
+        assertEq(g.balanceOf(TREASURY), 0); assertEq(g.balanceOf(LEDGER), 0);
+    }
+
+    function test_cancelAndWithdrawJustBefore365() public {
+        (uint256 id, uint256[] memory a) = _offer(1, 60);
+        uint256 t0 = block.timestamp;
+        (uint256 b1, uint256[] memory g1) = _bid(bob, id, 1, 61);
+        vm.warp(t0 + Y - 1);
+        _approveAll(bob); vm.prank(bob); d.withdrawBid(b1);
+        _approveAll(alice); vm.prank(alice); d.cancelOffer(id);
+        assertEq(g.ownerOf(a[0]), alice); assertEq(g.ownerOf(g1[0]), bob);
+    }
+
+    function test_finalizeJustBefore365ThenLosers183() public {
+        (uint256 id,) = _offer(1, 62);
+        uint256 t0 = block.timestamp;
+        (uint256 bw,) = _bid(bob, id, 1, 63);
+        (, uint256[] memory gl) = _bid(carol, id, 1, 64);
+        vm.warp(t0 + Y - 1);
+        _approveAll(alice); vm.prank(alice); d.acceptBid(id, bw);
+        vm.warp(t0 + Y + 10);
+        assertFalse(d.inBin(gl[0]));
+        vm.warp(t0 + Y - 1 + W);
+        assertTrue(d.inBin(gl[0]));
+    }
+
+    function test_houseCannotBeTreasury() public {
+        vm.expectRevert(GearTradeDesk.HouseIsTreasury.selector);
+        new GearTradeDesk(LEDGER, address(g), address(gt), VAULT, TREASURY, TREASURY);
+        vm.prank(LEDGER); vm.expectRevert(GearTradeDesk.HouseIsTreasury.selector); d.setHouse(TREASURY);
+        vm.prank(LEDGER); vm.expectRevert(GearTradeDesk.HouseIsTreasury.selector); d.setTreasury(LEDGER);
+        assertEq(d.house(), LEDGER);
     }
 
     function test_cannotBidOwnOffer() public {
@@ -236,10 +273,10 @@ contract DeskTest is Test {
         vm.prank(alice); d.sellToHouse(a);
         for (uint256 i; i < 4; i++) assertEq(g.ownerOf(a[i]), LEDGER);
         assertEq(gt.balanceOf(alice), _sumTeeth(a) * 1e6);
-        vm.prank(LEDGER); d.setHouse(TREASURY);
+        vm.prank(LEDGER); d.setHouse(dave);
         uint256[] memory b = _gears(bob, 1, 16);
         vm.prank(bob); d.sellToHouse(b);
-        assertEq(g.ownerOf(b[0]), TREASURY);
+        assertEq(g.ownerOf(b[0]), dave);
     }
 
     function test_pauseBlocksNewButNotWithdrawals() public {

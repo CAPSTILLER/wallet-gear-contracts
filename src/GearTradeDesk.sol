@@ -17,14 +17,15 @@ interface IWalletGear is IERC721 {
 /// @notice Every gear put up (offer or bid) is paid its primary tooth count in whole GEAR from the vault
 ///         immediately. Pulling out before finalization = repay 100% to vault. The offerer finalizes by
 ///         picking a bid AND repaying their GEAR (90% vault / 10% treasury) in one tx: gears swap, done.
-///         Losing bids stay withdrawable 183 days after finalize/cancel; idle offers expire 183 days after
-///         their last activity. Leftovers land in the abandoned bin, buyable by anyone at face value
+///         Losing bids stay withdrawable 183 days after finalize/cancel; offers not finalized within
+///         365 days of creation are abandoned (offer gears + open bids). Leftovers land in the abandoned bin, buyable by anyone at face value
 ///         (teeth GEAR). Bin status is computed lazily — no sweeping needed.
 contract GearTradeDesk is Ownable2Step, Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     uint256 public constant MAX_GEARS = 10;
-    uint256 public constant CLAIM_WINDOW = 183 days; // ~6 months
+    uint256 public constant CLAIM_WINDOW = 183 days; // ~6 months: losing bids after finalize, bids after cancel
+    uint256 public constant OFFER_LIFETIME = 365 days; // 12 months from creation to finalize, else abandoned
     uint256 public constant FINALIZE_TREASURY_BPS = 1000; // offerer repayment on finalize: 10% treasury, 90% vault
 
     enum OfferStatus { None, Open, Cancelled, Finalized }
@@ -33,7 +34,6 @@ contract GearTradeDesk is Ownable2Step, Pausable, ReentrancyGuard {
     struct Offer {
         address offerer;
         uint64 createdAt;
-        uint64 lastActivity; // creation or newest bid (idle-expiry clock while Open)
         uint64 closedAt; // cancel time or finalize time
         OfferStatus status;
         uint256 paid; // GEAR paid to offerer (what they repay)
@@ -93,6 +93,7 @@ contract GearTradeDesk is Ownable2Step, Pausable, ReentrancyGuard {
     error BadId();
     error BidNotOnOffer();
     error BadBps();
+    error HouseIsTreasury();
 
     constructor(address owner_, address gear_, address gearToken_, address vault_, address treasury_, address house_)
         Ownable(owner_)
@@ -105,6 +106,7 @@ contract GearTradeDesk is Ownable2Step, Pausable, ReentrancyGuard {
         unit = 10 ** IERC20Metadata(gearToken_).decimals();
         vault = vault_;
         treasury = treasury_;
+        if (house_ == treasury_) revert HouseIsTreasury();
         house = house_;
     }
 
@@ -118,7 +120,6 @@ contract GearTradeDesk is Ownable2Step, Pausable, ReentrancyGuard {
         Offer storage o = _offers.push();
         o.offerer = msg.sender;
         o.createdAt = uint64(block.timestamp);
-        o.lastActivity = uint64(block.timestamp);
         o.status = OfferStatus.Open;
         o.paid = owed;
         o.gears = tokenIds;
@@ -178,7 +179,6 @@ contract GearTradeDesk is Ownable2Step, Pausable, ReentrancyGuard {
         if (o.status != OfferStatus.Open) revert WrongStatus();
         if (o.offerer == msg.sender) revert OwnOffer();
         if (block.timestamp >= offerExpiry(offerId)) revert WindowClosed();
-        o.lastActivity = uint64(block.timestamp);
         uint256 owed = quote(tokenIds);
         _requireVault(owed);
         bidId = _bids.length;
@@ -198,7 +198,7 @@ contract GearTradeDesk is Ownable2Step, Pausable, ReentrancyGuard {
     }
 
     /// @notice Pull your (non-winning) bid: repay 100% to vault, get your gears back.
-    ///         Anytime while the offer is open (until it goes idle-expired); within 183 days after finalize/cancel.
+    ///         Anytime while the offer is open (until 365 days after offer creation); within 183 days after finalize/cancel.
     function withdrawBid(uint256 bidId) external nonReentrant {
         Bid storage b = _bid(bidId);
         if (b.taker != msg.sender) revert NotTaker();
@@ -243,8 +243,8 @@ contract GearTradeDesk is Ownable2Step, Pausable, ReentrancyGuard {
     // ================= owner =================
 
     function setVault(address v) external onlyOwner { if (v == address(0)) revert ZeroAddress(); vault = v; emit VaultSet(v); }
-    function setTreasury(address t) external onlyOwner { if (t == address(0)) revert ZeroAddress(); treasury = t; emit TreasurySet(t); }
-    function setHouse(address h) external onlyOwner { if (h == address(0)) revert ZeroAddress(); house = h; emit HouseSet(h); }
+    function setTreasury(address t) external onlyOwner { if (t == address(0)) revert ZeroAddress(); if (t == house) revert HouseIsTreasury(); treasury = t; emit TreasurySet(t); }
+    function setHouse(address h) external onlyOwner { if (h == address(0)) revert ZeroAddress(); if (h == treasury) revert HouseIsTreasury(); house = h; emit HouseSet(h); }
     function setBinTreasuryBps(uint256 bps) external onlyOwner { if (bps > 10_000) revert BadBps(); binTreasuryBps = bps; emit BinTreasuryBpsSet(bps); }
     function pause() external onlyOwner { _pause(); }
     function unpause() external onlyOwner { _unpause(); }
@@ -266,19 +266,19 @@ contract GearTradeDesk is Ownable2Step, Pausable, ReentrancyGuard {
 
     function vaultCanPay(uint256 amount) public view returns (bool) { return vaultAvailable() >= amount; }
 
-    /// @notice While Open: offer expires (exclusive) 183 days after its last activity (creation or newest bid).
+    /// @notice While Open: offer expires (exclusive) 365 days after creation (bids don't extend it).
     ///         After that the offerer can't finalize/cancel and its gears + open bids are bin-eligible.
     ///         Returns 0 if the offer is no longer Open.
     function offerExpiry(uint256 offerId) public view returns (uint256) {
         Offer storage o = _offer(offerId);
-        return o.status == OfferStatus.Open ? uint256(o.lastActivity) + CLAIM_WINDOW : 0;
+        return o.status == OfferStatus.Open ? uint256(o.createdAt) + OFFER_LIFETIME : 0;
     }
 
-    /// @notice When a non-winning bid's gears fall into the bin (exclusive). Open offer: its idle expiry.
+    /// @notice When a non-winning bid's gears fall into the bin (exclusive). Open offer: offer creation + 365d.
     ///         Finalized/cancelled offer: closedAt + 183d (closedAt >= bid time, so the more generous choice).
     function bidDeadline(uint256 bidId) public view returns (uint256) {
         Offer storage o = _offers[_bid(bidId).offerId];
-        return uint256(o.status == OfferStatus.Open ? o.lastActivity : o.closedAt) + CLAIM_WINDOW;
+        return o.status == OfferStatus.Open ? uint256(o.createdAt) + OFFER_LIFETIME : uint256(o.closedAt) + CLAIM_WINDOW;
     }
 
     function inBin(uint256 tokenId) public view returns (bool) {
@@ -290,7 +290,7 @@ contract GearTradeDesk is Ownable2Step, Pausable, ReentrancyGuard {
         h = heldInOffer[tokenId];
         if (h != 0) {
             Offer storage o = _offers[h - 1];
-            return o.status == OfferStatus.Open && block.timestamp >= uint256(o.lastActivity) + CLAIM_WINDOW;
+            return o.status == OfferStatus.Open && block.timestamp >= uint256(o.createdAt) + OFFER_LIFETIME;
         }
         return false;
     }
