@@ -38,3 +38,22 @@ forge install --no-git OpenZeppelin/openzeppelin-contracts@v5.1.0 foundry-rs/for
 forge test
 node fixtures/gen.mjs > fixtures/teeth.json   # regenerate traits3.js fixture
 ```
+
+## Desk Vault (GEAR float for the Trade Desk)
+
+`src/DeskVault.sol` — GearVault can't give the desk an allowance, so the desk pays from a DeskVault instead.
+Owned by the Ledger (Ownable2Step, renounce disabled). Repayments (90%) flow back into it.
+
+Owner functions: `approveSpender(spender, amount)`, `revokeSpender(spender)` (emergency stop),
+`withdrawGear(amount, to)`, `withdrawAllGear(to)`, `rescueToken(token, amount, to)`,
+`rescueERC721(nft, tokenId, to)`, `rescueERC1155(nft, id, amount, to)`, `rescueETH(to)`,
+`transferOwnership(newOwner)` / `acceptOwnership()` / `cancelOwnershipTransfer()`.
+Views: `gearBalance()`, `allowanceTo(spender)`.
+
+Deploy (owner = Ledger, gear = GEAR, Base):
+`forge script script/DeployDeskVault.s.sol:DeployDeskVault --rpc-url base --broadcast --verify`
+
+Ledger steps after deploy:
+1. GearVault `0x41ca72E18f7F96F8F2b7be524AC8346e06bCB3AB`: `withdrawGear(amount, deskVault)`
+2. DeskVault: `approveSpender(0x6B05415f46F7aDde0b9B343726257EBe34757374, amount or max)`
+3. GearTradeDesk `0x6B05415f46F7aDde0b9B343726257EBe34757374`: `setVault(deskVault)`
