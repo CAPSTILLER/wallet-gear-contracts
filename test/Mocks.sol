@@ -8,7 +8,7 @@ contract Mock6 is ERC20 {
     function mint(address to, uint256 a) external { _mint(to, a); }
 }
 
-interface IDeskLike { function createOffer(uint256[] calldata) external returns (uint256); function sellToHouse(uint256[] calldata) external; }
+interface IDeskLike { function sellToHouse(uint256[] calldata) external; }
 
 /// GEAR-like token with a transfer hook that tries to re-enter the desk.
 contract HookToken is Mock6 {
