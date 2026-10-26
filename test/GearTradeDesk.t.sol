@@ -15,7 +15,7 @@ contract DeskTest is Test {
     function setUp() public {
         usdc = new Mock6("USDC"); gt = new Mock6("GEAR");
         g = new WalletGear(LEDGER, address(usdc), TREASURY, 1e6, "");
-        d = new GearTradeDesk(LEDGER, address(g), address(gt), VAULT, TREASURY, LEDGER);
+        d = new GearTradeDesk(LEDGER, address(g), address(gt), VAULT, TREASURY);
         gt.mint(VAULT, 1_000_000e6);
         vm.prank(VAULT); gt.approve(address(d), type(uint256).max);
     }
@@ -134,12 +134,7 @@ contract DeskTest is Test {
         assertEq(gt.balanceOf(VAULT) - v0, price - price / 10);
         assertFalse(d.inBin(gl[0]));
         vm.prank(dave); vm.expectRevert(GearTradeDesk.NotInBin.selector); d.buyFromBin(gl[0]);
-        // owner-settable split
-        vm.prank(LEDGER); d.setBinTreasuryBps(5000);
-        vm.prank(LEDGER); vm.expectRevert(GearTradeDesk.BadBps.selector); d.setBinTreasuryBps(10001);
-        uint256 p2 = uint256(g.teethOf(gl[1])) * 1e6; tr0 = gt.balanceOf(TREASURY);
-        vm.prank(dave); d.buyFromBin(gl[1]);
-        assertEq(gt.balanceOf(TREASURY) - tr0, p2 / 2);
+
     }
 
     uint256 constant Y = 365 days;
@@ -191,14 +186,6 @@ contract DeskTest is Test {
         assertFalse(d.inBin(gl[0]));
         vm.warp(t0 + Y - 1 + W);
         assertTrue(d.inBin(gl[0]));
-    }
-
-    function test_houseCannotBeTreasury() public {
-        vm.expectRevert(GearTradeDesk.HouseIsTreasury.selector);
-        new GearTradeDesk(LEDGER, address(g), address(gt), VAULT, TREASURY, TREASURY);
-        vm.prank(LEDGER); vm.expectRevert(GearTradeDesk.HouseIsTreasury.selector); d.setHouse(TREASURY);
-        vm.prank(LEDGER); vm.expectRevert(GearTradeDesk.HouseIsTreasury.selector); d.setTreasury(LEDGER);
-        assertEq(d.house(), LEDGER);
     }
 
     function test_cannotBidOwnOffer() public {
@@ -268,15 +255,56 @@ contract DeskTest is Test {
         d.createOffer(a);
     }
 
-    function test_sellToHouse() public {
-        uint256[] memory a = _gears(alice, 4, 15);
+    function _price(uint256 id) internal view returns (uint256) {
+        uint8 t = g.teethOf(id); return uint256(t == 32 ? 35 : t == 18 ? 20 : 12) * 1e6;
+    }
+
+    function test_sellToHouseGoesToPurchasedBin() public {
+        uint256[] memory a = _gears(alice, 10, 15);
         vm.prank(alice); d.sellToHouse(a);
-        for (uint256 i; i < 4; i++) assertEq(g.ownerOf(a[i]), LEDGER);
+        for (uint256 i; i < 10; i++) assertEq(g.ownerOf(a[i]), address(d));
         assertEq(gt.balanceOf(alice), _sumTeeth(a) * 1e6);
-        vm.prank(LEDGER); d.setHouse(dave);
-        uint256[] memory b = _gears(bob, 1, 16);
-        vm.prank(bob); d.sellToHouse(b);
-        assertEq(g.ownerOf(b[0]), dave);
+        assertEq(d.purchasedCount(), 10);
+        assertEq(d.purchasedTokens(0, 100).length, 10);
+        assertEq(d.purchasedTokens(8, 5).length, 2);
+        // not in abandoned section
+        assertFalse(d.inBin(a[0]));
+        vm.prank(dave); vm.expectRevert(GearTradeDesk.NotInBin.selector); d.buyFromBin(a[0]);
+        gt.mint(dave, 10_000e6); _approveAll(dave);
+        bool s32; bool s18; bool s11;
+        for (uint256 i; i < 10; i++) {
+            uint256 p = _price(a[i]);
+            assertEq(d.purchasedPriceOf(a[i]), p);
+            uint8 t = g.teethOf(a[i]);
+            if (t == 32) s32 = true; else if (t == 18) s18 = true; else s11 = true;
+            uint256 v0 = gt.balanceOf(VAULT); uint256 tr0 = gt.balanceOf(TREASURY); uint256 d0 = gt.balanceOf(dave);
+            vm.prank(dave); d.buyPurchased(a[i]);
+            assertEq(g.ownerOf(a[i]), dave);
+            assertEq(d0 - gt.balanceOf(dave), p);
+            assertEq(gt.balanceOf(TREASURY) - tr0, p / 10);
+            assertEq(gt.balanceOf(VAULT) - v0, p - p / 10);
+            assertEq(d.purchasedCount(), 9 - i);
+        }
+        assertTrue(s32 && s18 && s11); // all three prices exercised
+        vm.prank(dave); vm.expectRevert(GearTradeDesk.NotInBin.selector); d.buyPurchased(a[0]);
+        assertEq(g.balanceOf(TREASURY), 0); assertEq(g.balanceOf(LEDGER), 0);
+    }
+
+    function test_purchasedPriceConstants() public view {
+        assertEq(d.PURCHASED_PRICE_32(), 35); assertEq(d.PURCHASED_PRICE_18(), 20); assertEq(d.PURCHASED_PRICE_11(), 12);
+        assertEq(d.TREASURY_BPS(), 1000);
+    }
+
+    function test_sectionsListedSeparately() public {
+        (uint256 id, uint256[] memory a) = _offer(1, 70);
+        uint256[] memory s1 = _gears(bob, 2, 71);
+        vm.prank(bob); d.sellToHouse(s1);
+        vm.warp(block.timestamp + 365 days);
+        (uint256[] memory ab, uint256 n) = d.binTokensFromOffers(0, 10);
+        assertEq(n, 1); assertEq(ab[0], a[0]);
+        assertEq(d.purchasedCount(), 2);
+        vm.prank(dave); vm.expectRevert(GearTradeDesk.NotInBin.selector); d.buyPurchased(a[0]);
+        id;
     }
 
     function test_pauseBlocksNewButNotWithdrawals() public {
@@ -338,7 +366,7 @@ contract DeskTest is Test {
 
     function test_reentrancyBlocked() public {
         HookToken h = new HookToken();
-        GearTradeDesk d2 = new GearTradeDesk(LEDGER, address(g), address(h), VAULT, TREASURY, LEDGER);
+        GearTradeDesk d2 = new GearTradeDesk(LEDGER, address(g), address(h), VAULT, TREASURY);
         h.mint(VAULT, 1000e6);
         vm.prank(VAULT); h.approve(address(d2), type(uint256).max);
         uint256[] memory a = _gears(alice, 1, 30);

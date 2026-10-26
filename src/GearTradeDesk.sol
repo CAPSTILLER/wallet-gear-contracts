@@ -13,12 +13,12 @@ interface IWalletGear is IERC721 {
     function teethOf(uint256 tokenId) external pure returns (uint8);
 }
 
-/// @title Gear Trade Desk v2 — offers with many bids, one-tx finalize, abandoned bin, sell-to-house.
+/// @title Gear Trade Desk v2 — offers with many bids, one-tx finalize, two-section bin (abandoned + purchased), sell-to-house.
 /// @notice Every gear put up (offer or bid) is paid its primary tooth count in whole GEAR from the vault
 ///         immediately. Pulling out before finalization = repay 100% to vault. The offerer finalizes by
 ///         picking a bid AND repaying their GEAR (90% vault / 10% treasury) in one tx: gears swap, done.
 ///         Losing bids stay withdrawable 183 days after finalize/cancel; offers not finalized within
-///         365 days of creation are abandoned (offer gears + open bids). Leftovers land in the abandoned bin, buyable by anyone at face value
+///         365 days of creation are abandoned (offer gears + open bids). Leftovers land in the abandoned bin section, buyable by anyone at face value
 ///         (teeth GEAR). Bin status is computed lazily — no sweeping needed.
 contract GearTradeDesk is Ownable2Step, Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
@@ -26,7 +26,12 @@ contract GearTradeDesk is Ownable2Step, Pausable, ReentrancyGuard {
     uint256 public constant MAX_GEARS = 10;
     uint256 public constant CLAIM_WINDOW = 183 days; // ~6 months: losing bids after finalize, bids after cancel
     uint256 public constant OFFER_LIFETIME = 365 days; // 12 months from creation to finalize, else abandoned
-    uint256 public constant FINALIZE_TREASURY_BPS = 1000; // offerer repayment on finalize: 10% treasury, 90% vault
+    /// Every GEAR-for-gear payment (finalize repay, abandoned bin section buy, purchased bin buy): 10% treasury, 90% vault.
+    uint256 public constant TREASURY_BPS = 1000;
+    /// Purchased-bin prices in whole GEAR (≈10% over face value).
+    uint256 public constant PURCHASED_PRICE_32 = 35;
+    uint256 public constant PURCHASED_PRICE_18 = 20;
+    uint256 public constant PURCHASED_PRICE_11 = 12;
 
     enum OfferStatus { None, Open, Cancelled, Finalized }
     enum BidStatus { None, Open, Withdrawn, Won }
@@ -56,8 +61,9 @@ contract GearTradeDesk is Ownable2Step, Pausable, ReentrancyGuard {
     uint256 public immutable unit; // 10**decimals of GEAR
     address public vault;
     address public treasury;
-    address public house;
-    uint256 public binTreasuryBps = 1000; // bin purchase split: 10% treasury, 90% vault (owner-settable)
+    /// Gears sold to the house sit in the desk's purchased bin. tokenId => index+1 in _purchased.
+    uint256[] internal _purchased;
+    mapping(uint256 => uint256) public purchasedIndex;
 
     Offer[] internal _offers;
     Bid[] internal _bids;
@@ -75,11 +81,10 @@ contract GearTradeDesk is Ownable2Step, Pausable, ReentrancyGuard {
     event BidAccepted(uint256 indexed offerId, uint256 indexed bidId, address indexed taker);
     event Finalized(uint256 indexed offerId, uint256 indexed bidId, address indexed taker, uint256 toVault, uint256 toTreasury);
     event BinPurchase(address indexed buyer, uint256 indexed tokenId, uint256 toVault, uint256 toTreasury);
-    event SoldToHouse(address indexed seller, address indexed house, uint256[] tokenIds, uint256 paid);
+    event SoldToHouse(address indexed seller, uint256[] tokenIds, uint256 paid);
+    event PurchasedBinBuy(address indexed buyer, uint256 indexed tokenId, uint256 toVault, uint256 toTreasury);
     event VaultSet(address indexed vault);
     event TreasurySet(address indexed treasury);
-    event HouseSet(address indexed house);
-    event BinTreasuryBpsSet(uint256 bps);
 
     error BadCount();
     error VaultCannotPay(uint256 owed, uint256 available);
@@ -92,13 +97,11 @@ contract GearTradeDesk is Ownable2Step, Pausable, ReentrancyGuard {
     error ZeroAddress();
     error BadId();
     error BidNotOnOffer();
-    error BadBps();
-    error HouseIsTreasury();
 
-    constructor(address owner_, address gear_, address gearToken_, address vault_, address treasury_, address house_)
+    constructor(address owner_, address gear_, address gearToken_, address vault_, address treasury_)
         Ownable(owner_)
     {
-        if (gear_ == address(0) || gearToken_ == address(0) || vault_ == address(0) || treasury_ == address(0) || house_ == address(0)) {
+        if (gear_ == address(0) || gearToken_ == address(0) || vault_ == address(0) || treasury_ == address(0)) {
             revert ZeroAddress();
         }
         gear = IWalletGear(gear_);
@@ -106,8 +109,6 @@ contract GearTradeDesk is Ownable2Step, Pausable, ReentrancyGuard {
         unit = 10 ** IERC20Metadata(gearToken_).decimals();
         vault = vault_;
         treasury = treasury_;
-        if (house_ == treasury_) revert HouseIsTreasury();
-        house = house_;
     }
 
     // ================= offerer =================
@@ -162,10 +163,7 @@ contract GearTradeDesk is Ownable2Step, Pausable, ReentrancyGuard {
         _clearOffer(o.gears);
         uint256[] storage won = b.gears;
         for (uint256 i; i < won.length; i++) delete heldInBid[won[i]];
-        uint256 toTreasury = o.paid * FINALIZE_TREASURY_BPS / 10_000;
-        uint256 toVault = o.paid - toTreasury;
-        gearToken.safeTransferFrom(msg.sender, vault, toVault);
-        if (toTreasury > 0) gearToken.safeTransferFrom(msg.sender, treasury, toTreasury);
+        (uint256 toVault, uint256 toTreasury) = _paySplit(o.paid);
         _sendGears(o.gears, b.taker);
         _sendGears(won, msg.sender);
         emit Finalized(offerId, bidId, b.taker, toVault, toTreasury);
@@ -212,40 +210,52 @@ contract GearTradeDesk is Ownable2Step, Pausable, ReentrancyGuard {
         emit BidWithdrawn(b.offerId, bidId, msg.sender, b.paid);
     }
 
-    // ================= abandoned bin =================
+    // ================= bin: abandoned section =================
 
-    /// @notice Buy one abandoned gear for face value (teeth GEAR). Split: binTreasuryBps to treasury, rest to vault.
+    /// @notice Buy one abandoned gear for face value (teeth GEAR). 90% vault / 10% treasury.
     function buyFromBin(uint256 tokenId) external whenNotPaused nonReentrant {
         if (!inBin(tokenId)) revert NotInBin();
         delete heldInBid[tokenId];
         delete heldInOffer[tokenId];
-        uint256 price = payoutOf(tokenId);
-        uint256 toTreasury = price * binTreasuryBps / 10_000;
-        uint256 toVault = price - toTreasury;
-        gearToken.safeTransferFrom(msg.sender, vault, toVault);
-        if (toTreasury > 0) gearToken.safeTransferFrom(msg.sender, treasury, toTreasury);
+        (uint256 toVault, uint256 toTreasury) = _paySplit(payoutOf(tokenId));
         gear.transferFrom(address(this), msg.sender, tokenId);
         emit BinPurchase(msg.sender, tokenId, toVault, toTreasury);
     }
 
-    // ================= house =================
+    // ================= bin: purchased section =================
 
-    /// @notice Sell 1..10 gears straight to the house for their tooth-count GEAR from the vault.
+    /// @notice Sell 1..10 gears to the house for their tooth-count GEAR from the vault.
+    ///         The gears stay in the desk, listed in the purchased bin.
     function sellToHouse(uint256[] calldata tokenIds) external whenNotPaused nonReentrant {
         uint256 owed = quote(tokenIds);
         _requireVault(owed);
-        address h = house;
-        _pullGears(tokenIds, msg.sender, h);
+        for (uint256 i; i < tokenIds.length; i++) {
+            _purchased.push(tokenIds[i]);
+            purchasedIndex[tokenIds[i]] = _purchased.length;
+        }
+        _pullGears(tokenIds, msg.sender, address(this));
         gearToken.safeTransferFrom(vault, msg.sender, owed);
-        emit SoldToHouse(msg.sender, h, tokenIds, owed);
+        emit SoldToHouse(msg.sender, tokenIds, owed);
+    }
+
+    /// @notice Buy one gear from the purchased bin at 35 / 20 / 12 GEAR (32T / 18T / 11T). 90% vault / 10% treasury.
+    function buyPurchased(uint256 tokenId) external whenNotPaused nonReentrant {
+        uint256 idx = purchasedIndex[tokenId];
+        if (idx == 0) revert NotInBin();
+        uint256 last = _purchased[_purchased.length - 1];
+        _purchased[idx - 1] = last;
+        purchasedIndex[last] = idx;
+        _purchased.pop();
+        delete purchasedIndex[tokenId];
+        (uint256 toVault, uint256 toTreasury) = _paySplit(purchasedPriceOf(tokenId));
+        gear.transferFrom(address(this), msg.sender, tokenId);
+        emit PurchasedBinBuy(msg.sender, tokenId, toVault, toTreasury);
     }
 
     // ================= owner =================
 
     function setVault(address v) external onlyOwner { if (v == address(0)) revert ZeroAddress(); vault = v; emit VaultSet(v); }
-    function setTreasury(address t) external onlyOwner { if (t == address(0)) revert ZeroAddress(); if (t == house) revert HouseIsTreasury(); treasury = t; emit TreasurySet(t); }
-    function setHouse(address h) external onlyOwner { if (h == address(0)) revert ZeroAddress(); if (h == treasury) revert HouseIsTreasury(); house = h; emit HouseSet(h); }
-    function setBinTreasuryBps(uint256 bps) external onlyOwner { if (bps > 10_000) revert BadBps(); binTreasuryBps = bps; emit BinTreasuryBpsSet(bps); }
+    function setTreasury(address t) external onlyOwner { if (t == address(0)) revert ZeroAddress(); treasury = t; emit TreasurySet(t); }
     function pause() external onlyOwner { _pause(); }
     function unpause() external onlyOwner { _unpause(); }
 
@@ -256,6 +266,22 @@ contract GearTradeDesk is Ownable2Step, Pausable, ReentrancyGuard {
     function quote(uint256[] calldata tokenIds) public view returns (uint256 total) {
         if (tokenIds.length == 0 || tokenIds.length > MAX_GEARS) revert BadCount();
         for (uint256 i; i < tokenIds.length; i++) total += payoutOf(tokenIds[i]);
+    }
+
+    function purchasedPriceOf(uint256 tokenId) public view returns (uint256) {
+        uint8 t = gear.teethOf(tokenId);
+        return (t == 32 ? PURCHASED_PRICE_32 : t == 18 ? PURCHASED_PRICE_18 : PURCHASED_PRICE_11) * unit;
+    }
+
+    function purchasedCount() external view returns (uint256) { return _purchased.length; }
+
+    /// @notice Paged list of the purchased bin section.
+    function purchasedTokens(uint256 start, uint256 count) external view returns (uint256[] memory out) {
+        uint256 n = _purchased.length;
+        if (start >= n) return out;
+        uint256 end = start + count > n ? n : start + count;
+        out = new uint256[](end - start);
+        for (uint256 i = start; i < end; i++) out[i - start] = _purchased[i];
     }
 
     function vaultAvailable() public view returns (uint256) {
@@ -351,6 +377,13 @@ contract GearTradeDesk is Ownable2Step, Pausable, ReentrancyGuard {
 
     function _clearOffer(uint256[] storage ids) internal {
         for (uint256 i; i < ids.length; i++) delete heldInOffer[ids[i]];
+    }
+
+    function _paySplit(uint256 amount) internal returns (uint256 toVault, uint256 toTreasury) {
+        toTreasury = amount * TREASURY_BPS / 10_000;
+        toVault = amount - toTreasury;
+        gearToken.safeTransferFrom(msg.sender, vault, toVault);
+        if (toTreasury > 0) gearToken.safeTransferFrom(msg.sender, treasury, toTreasury);
     }
 
     function _requireVault(uint256 owed) internal view {

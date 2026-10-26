@@ -5,7 +5,7 @@ Two contracts, both owned by Cap's Ledger `0xD8382719b8fF90eE3Dd521B9d7c5dc23E8e
 | Contract | What it does |
 |---|---|
 | `WalletGear` (ERC-721 "WGEAR") | One gear per wallet, ever. `tokenId = uint256(uint160(minter))`, so traits stay tied to the minter forever. `mint()` pulls exactly **1 USDC** (owner-settable) straight to the gear treasury. `teethOf(id)` = primary tooth count 11/18/32, identical to `traits3.js` (tested on 512 addresses). `tokenURI = baseURI + tokenId`. Owner: pause, price, treasury, baseURI. |
-| `GearTradeDesk` | Offers with many bids, one-tx finalize, abandoned bin, sell-to-house. Payout per gear = `teethOf` whole GEAR from the gear vault. Refuses any offer, bid or sale the vault can't fully pay (balance **and** allowance). That works as an automatic pause, and nothing moves. |
+| `GearTradeDesk` | Offers with many bids, one-tx finalize, two-section bin (abandoned + purchased), sell-to-house. Payout per gear = `teethOf` whole GEAR from the gear vault. Refuses any offer, bid or sale the vault can't fully pay (balance **and** allowance). That works as an automatic pause, and nothing moves. |
 
 Addresses: Base USDC `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913` · GEAR `0x5880cD05605A549f1DAb01a53ca61Ee559244bD1` (6 decimals) · gear vault `0x41ca72E18f7F96F8F2b7be524AC8346e06bCB3AB` · gear treasury `0xCF1ac98565DA846E8263604b49C1276Ed78A0981`.
 
@@ -16,13 +16,14 @@ Addresses: Base USDC `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913` · GEAR `0x588
 4. **Finalize** (`acceptBid`, offerer only): the offerer picks one bid and pays back their GEAR in the same transaction (90% vault / 10% treasury). Their gears go to that bidder, the bidder's gears go to the offerer, and the trade is done. The winning bidder keeps the GEAR they were paid. This doesn't loop over other bids, so gas stays flat no matter how many bids there are.
 5. **Losing bids:** after a finalize or cancel, the other bidders have 183 days to withdraw (repaying 100% to the vault). The clock starts at the finalize or cancel time, which is always later than the bid itself, so it's the more generous choice for bidders.
 6. **12-month limit:** an offer that isn't finalized within 365 days of when it was **created** is abandoned. Late bids don't extend that deadline. Before then, the offerer can cancel and bidders can withdraw. At the deadline, the offerer's gears and every open bid on that offer go into the bin.
-7. **Abandoned bin** (`buyFromBin`): anyone, including Cap, can buy any binned gear for face value, its tooth count in GEAR. The payment splits 90% vault / 10% treasury by default, and the owner can change that with `setBinTreasuryBps`. Bin status is worked out automatically, so nobody has to sweep. The owner has no special way to take users' gears.
-**No gear NFT ever goes to the treasury.** The treasury only receives GEAR tokens. Abandoned gears only go to the bin.
+7. **Bin, abandoned section** (`buyFromBin`): anyone, including Cap, can buy any abandoned gear at face value: 32, 18 or 11 GEAR. Bin status is worked out automatically, so nobody has to sweep. The owner has no special way to take users' gears.
+8. **Sell to house + bin, purchased section** (`sellToHouse`, `buyPurchased`): a user sells 1–10 gears for their tooth-count GEAR from the vault. The gears stay in the desk, listed in the purchased section. Anyone can buy them at fixed prices: 32T = **35 GEAR**, 18T = **20**, 11T = **12** (constants). There is no house wallet.
+**Fixed 90/10 split:** every GEAR-for-gear payment (finalize repay, abandoned buy, purchased buy) goes 90% vault / 10% treasury (constant `TREASURY_BPS`, not changeable). Cancel and bid-withdraw repayments go 100% to the vault.
+**No gear NFT ever goes to the treasury, the owner or any house wallet.** Gears only move between users and the desk.
 
-8. **Sell to house** (`sellToHouse`): send 1–10 gears to the `house` address (the Ledger by default; the owner can change it, but never to the treasury). This is a voluntary sale by the user for their tooth-count GEAR from the vault.
-9. **Pause** blocks new offers, bids, finalizes, house sales and bin purchases. Cancels and bid withdrawals always work.
+9. **Pause** blocks new offers, bids, finalizes, house sales and both kinds of bin purchase. Cancels and bid withdrawals always work.
 
-UI views: `quote`, `payoutOf`, `vaultAvailable`, `vaultCanPay`, `offerCount`, `bidCount`, `getOffer`, `getBid`, `getOffers(start,count)`, `getBidsForOffer(offerId,start,count)`, `offerIdsOf`, `bidIdsOf`, `offerExpiry`, `bidDeadline`, `inBin`, `binTokens(bidStart,count)`, `binTokensFromOffers(offerStart,count)`.
+UI views: `quote`, `payoutOf`, `vaultAvailable`, `vaultCanPay`, `offerCount`, `bidCount`, `getOffer`, `getBid`, `getOffers(start,count)`, `getBidsForOffer(offerId,start,count)`, `offerIdsOf`, `bidIdsOf`, `offerExpiry`, `bidDeadline`, `inBin`, `binTokens(bidStart,count)`, `binTokensFromOffers(offerStart,count)` (abandoned section); `purchasedCount`, `purchasedTokens(start,count)`, `purchasedPriceOf`, `purchasedIndex` (purchased section).
 
 ## Deploy + setup (Bankr / Cap) — 5 steps
 1. **Deploy both** (deployer wallet, Base): `BASE_URI=ipfs://<metadataCID>/ forge script script/Deploy.s.sol --rpc-url https://mainnet.base.org --broadcast --account <deployer>` (prints both addresses; deployer key is never in this repo).

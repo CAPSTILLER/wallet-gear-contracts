@@ -17,7 +17,7 @@ contract Deploy is Script {
         string memory baseURI = vm.envOr("BASE_URI", string(""));
         vm.startBroadcast();
         WalletGear g = new WalletGear(msg.sender, USDC, TREASURY, 1_000_000, baseURI);
-        GearTradeDesk d = new GearTradeDesk(msg.sender, address(g), GEAR, VAULT, TREASURY, LEDGER);
+        GearTradeDesk d = new GearTradeDesk(msg.sender, address(g), GEAR, VAULT, TREASURY);
         g.transferOwnership(LEDGER);
         d.transferOwnership(LEDGER);
         vm.stopBroadcast();
